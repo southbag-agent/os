@@ -1,0 +1,78 @@
+name: pages-fixture
+
+# DISPOSABLE validation harness for the pages.yml packaging path. Lives only
+# on the agent/pages-fixture-harness branch; runs on the push that creates
+# it. Replicates the exact "Build, sign and verify the apt repository" step
+# from pages.yml with a throwaway key generated IN THE RUNNER - no secrets,
+# no Pages permissions, no deploy steps, nothing published.
+
+on:
+  push:
+    branches: [agent/pages-fixture-harness]
+
+permissions:
+  contents: read
+
+jobs:
+  fixture:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      - run: bun run build
+
+      - name: Generate a throwaway signing key (never leaves the runner)
+        run: |
+          set -euo pipefail
+          export GNUPGHOME="$RUNNER_TEMP/gnupg"
+          mkdir -p "$GNUPGHOME" && chmod 700 "$GNUPGHOME"
+          gpg --batch --pinentry-mode loopback --passphrase '' \
+            --quick-gen-key 'Southbag Fixture <fixture@southbag.invalid>' ed25519 sign never
+          fpr="$(gpg --batch --with-colons -k | awk -F: '/^fpr:/ {print $10; exit}')"
+          gpg --batch --pinentry-mode loopback --passphrase '' \
+            --armor --export-secret-keys "$fpr" > "$RUNNER_TEMP/fixture-key.asc"
+          # verify-repo.sh proves against the COMMITTED keyring path; place
+          # the fixture public key there for this run only (never committed).
+          mkdir -p image/config/includes.chroot/usr/share/keyrings
+          gpg --batch --export "$fpr" > image/config/includes.chroot/usr/share/keyrings/southbag-archive-keyring.gpg
+          echo "FIXTURE_KEY_PATH=$RUNNER_TEMP/fixture-key.asc" >> "$GITHUB_ENV"
+
+      - name: Build, sign and verify the apt repository (fixture)
+        env:
+          SOUTHBAG_BROWSER_VERSION: ""
+        run: |
+          set -euo pipefail
+          export SOUTHBAG_APT_SIGNING_KEY="$(cat "$FIXTURE_KEY_PATH")"
+          bun run build:device
+          mkdir -p out/pool dist/apt
+          bash packaging/build-shell-deb.sh "0.1.0+${GITHUB_SHA:0:7}" dist-device out/pool
+          bash packaging/fetch-browser-deb.sh "$SOUTHBAG_BROWSER_VERSION" out/pool
+          # EXACT docker block from pages.yml (lockd builds against the
+          # trixie userland; identical hook-0016 -dev package list).
+          if [ -f image/config/includes.chroot/opt/southbag-lockd-src/southbag-lockd.c ]; then
+            VERSION="0.1.0+${GITHUB_SHA:0:7}"
+            docker run --rm -e VERSION -v "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE" -w "$GITHUB_WORKSPACE" debian:trixie bash -c '
+              set -euo pipefail
+              apt-get update -qq
+              apt-get install -y -qq --no-install-recommends build-essential pkg-config libwayland-dev wayland-protocols libcairo2-dev libxkbcommon-dev libjpeg62-turbo-dev
+              bash packaging/build-lockd-deb.sh "$VERSION" out/pool
+            '
+          fi
+          bash packaging/build-repo.sh out/pool dist/apt
+          bash packaging/verify-repo.sh dist/apt
+
+      - name: Negative control - a wrong keyring must fail verification
+        run: |
+          set -euo pipefail
+          export GNUPGHOME="$RUNNER_TEMP/gnupg2"
+          mkdir -p "$GNUPGHOME" && chmod 700 "$GNUPGHOME"
+          gpg --batch --pinentry-mode loopback --passphrase '' \
+            --quick-gen-key 'Wrong Key <wrong@example.invalid>' ed25519 sign never
+          wpr="$(gpg --batch --with-colons -k | awk -F: '/^fpr:/ {print $10; exit}')"
+          gpg --batch --export "$wpr" > image/config/includes.chroot/usr/share/keyrings/southbag-archive-keyring.gpg
+          if bash packaging/verify-repo.sh dist/apt; then
+            echo "::error::verify-repo.sh ACCEPTED a repository signed by an unknown key"
+            exit 1
+          fi
+          echo "Wrong keyring rejected as designed."
