@@ -29,7 +29,7 @@ const DEFAULT_ISSUER = "https://identity.southbag.cc";
 const ISSUER_KEY = "southbag.identity.issuer";
 const CLIENT_KEY = "southbag.identity.client";
 const PENDING_KEY = "southbag.identity.pending";
-const PENDING_TTL_MS = 10 * 60 * 1000;
+const PENDING_TTL_MS = 60 * 60 * 1000; // TEST-ONLY qualification build: relaxed pending-login TTL for slow TCG emulation. Never merge toward main.
 
 export const SCOPES = "openid profile email";
 
